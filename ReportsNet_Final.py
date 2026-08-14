@@ -68,16 +68,15 @@ class CircularPolarConv2d(nn.Module):
         return self.act(x)
 
 # ==========================================
-# Model 10.1: Hierarchical Frequency RoPE
+# 层次化频率 RoPE
 # ==========================================
 
 class HierarchicalPolarRoPE(nn.Module):
     """
     层次化极坐标旋转位置编码 (Hierarchical Frequency RoPE)
 
-    改进点（相比Checkerboard RRPE）：
-    1. L维（径向）：多频率RoPE，不同通道对使用不同频率，捕获多尺度径向结构
-    2. K维（角度）：单频率真2D旋转矩阵，非标量近似，实现真正的旋转等变性
+    - L 维（径向）：多频率 RoPE，不同通道对使用不同频率，捕获多尺度径向结构
+    - K 维（角度）：单频率真 2D 旋转矩阵，实现真正的旋转等变性
 
     数学公式：
     - Radial (L): x'_c = x_c * cos(l * ω_c) + x_{c+1} * sin(l * ω_c)
@@ -89,13 +88,12 @@ class HierarchicalPolarRoPE(nn.Module):
         self.L = L
         self.max_relative_angle = max_relative_angle
 
-        # 1. L维：多频率RoPE (base=10000)
-        # 频率: ω_c = base^(-2c/d), d = C // 2
+        # L 维：多频率 RoPE，频率 ω_c = base^(-2c/d), d = C // 2
         d = C // 2
-        freqs = 1.0 / (base ** (torch.arange(0, d, 1).float() / d))  # (d,)
-        self.register_buffer('freqs', freqs)  # (C//2,)
+        freqs = 1.0 / (base ** (torch.arange(0, d, 1).float() / d))
+        self.register_buffer('freqs', freqs)
 
-        # 2. K维：预计算所有相对角度的 sin/cos (单频率)
+        # K 维：预计算所有相对角度的 sin/cos（单频率）
         angles_idx = torch.arange(max_relative_angle).float()
         rotation_angles = angles_idx * (2 * math.pi / max_relative_angle)
         self.register_buffer('sin_vals', torch.sin(rotation_angles))
@@ -103,170 +101,119 @@ class HierarchicalPolarRoPE(nn.Module):
 
     def forward(self, x, rel_angle_idx):
         """
-        对 x 应用层次化极坐标旋转位置编码
-
-        Args:
-            x: 输入特征，形状 (B, C, K, L)
-            rel_angle_idx: 相对角度索引矩阵，形状 (K, K)
-
-        Returns:
-            旋转后的特征，形状 (B, C, K, K, L)
+        x: (B, C, K, L)
+        rel_angle_idx: (K, K)
+        返回旋转后的特征 (B, C, K, K, L)
         """
         B, C, K_num, L = x.shape
         K = K_num
 
-        # ========== Step 1: L维 - 多频率RoPE (Radial) ==========
-        # 将C分为两组通道对，应用不同频率
-        # x: (B, C, K, L) -> 重塑为 (B, 2, C//2, K, L)
-        x_reshaped = x.view(B, 2, C // 2, K, L)  # (B, 2, C//2, K, L)
+        # ========== Step 1: L 维多频率 RoPE（径向） ==========
+        # C 分为两组通道对，应用不同频率
+        x_reshaped = x.view(B, 2, C // 2, K, L)
 
-        # 生成L维的位置编码: (C//2, L)
-        l_positions = torch.arange(L, device=x.device).float()  # (L,)
-        # freqs: (C//2,) -> 扩展到 (C//2, L)
-        freqs_l = self.freqs.view(-1, 1) * l_positions.view(1, L)  # (C//2, L)
+        l_positions = torch.arange(L, device=x.device).float()
+        freqs_l = self.freqs.view(-1, 1) * l_positions.view(1, L)
 
-        # 计算 sin/cos: (C//2, L)
-        sin_l = torch.sin(freqs_l).unsqueeze(0).unsqueeze(2)  # (1, C//2, 1, L)
-        cos_l = torch.cos(freqs_l).unsqueeze(0).unsqueeze(2)  # (1, C//2, 1, L)
+        sin_l = torch.sin(freqs_l).unsqueeze(0).unsqueeze(2)
+        cos_l = torch.cos(freqs_l).unsqueeze(0).unsqueeze(2)
 
-        # 应用L维RoPE: x_0 * cos + x_1 * sin
-        x_0 = x_reshaped[:, 0]  # (B, C//2, K, L)
-        x_1 = x_reshaped[:, 1]  # (B, C//2, K, L)
+        x_0 = x_reshaped[:, 0]
+        x_1 = x_reshaped[:, 1]
         x_l_rope = torch.cat([
             x_0 * cos_l - x_1 * sin_l,
             x_0 * sin_l + x_1 * cos_l,
-        ], dim=1)  # (B, C, K, L)
+        ], dim=1)
 
-        # ========== Step 2: K维 - 真2D旋转 (Angular) ==========
+        # ========== Step 2: K 维真 2D 旋转（角度） ==========
         # 扩展 x 以生成所有相对角度的版本
-        # x_l_rope: (B, C, K, L) -> (B, C, K, K, L)
-        x_expanded = x_l_rope.unsqueeze(2).expand(-1, -1, K, -1, -1)  # (B, C, K, K, L)
+        x_expanded = x_l_rope.unsqueeze(2).expand(-1, -1, K, -1, -1)
 
-        # 获取对应相对角度的 sin/cos 值
-        sin_theta = self.sin_vals[rel_angle_idx]  # (K, K)
-        cos_theta = self.cos_vals[rel_angle_idx]  # (K, K)
-
-        # 扩展到 (1, 1, K, K, 1)
+        sin_theta = self.sin_vals[rel_angle_idx]
+        cos_theta = self.cos_vals[rel_angle_idx]
         sin_theta = sin_theta.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
         cos_theta = cos_theta.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
 
-        # 对通道对 (c, c+1) 应用2D旋转矩阵
-        # 重塑为 (B, 2, C//2, K, K, L)
         x_pair = x_expanded.view(B, 2, C // 2, K, K, L)
+        x_c = x_pair[:, 0]
+        x_c1 = x_pair[:, 1]
 
-        x_c = x_pair[:, 0]  # (B, C//2, K, K, L)
-        x_c1 = x_pair[:, 1]  # (B, C//2, K, K, L)
-
-        # 旋转公式: x' = x*cos - y*sin, y' = x*sin + y*cos
         x_rot = x_c * cos_theta - x_c1 * sin_theta
         x_rot_1 = x_c * sin_theta + x_c1 * cos_theta
 
-        # 合并回去: (B, C, K, K, L)
-        x_final = torch.cat([x_rot, x_rot_1], dim=1)
-
-        return x_final
+        return torch.cat([x_rot, x_rot_1], dim=1)
 
 
 class CircularSelfAttentionWithRRPE(nn.Module):
     """
-    Model 10.1: 基线-转线分离设计的注意力机制（Vision1DStyle 方式）
-    使用 HierarchicalPolarRoPE 层次化频率编码
-
-    每条线都作为基线，与其他所有转线交互
-    Q 从线 i 得到，K、V 从线 j 得到（每条线独立计算）
-    对 K 应用 HierarchicalPolarRoPE（多频率径向 + 单频率角度）
+    基线-转线分离设计的注意力：每条线都作为基线，与其他所有转线交互。
+    Q 来自线 i，K、V 来自线 j；对 K 应用 HierarchicalPolarRoPE。
     """
     def __init__(self, channels, L=11, K=24, num_heads=1):
         super().__init__()
         self.K, self.L, self.C = K, L, channels
         self.num_heads = num_heads
 
-        # Q、K、V 投影（Conv1d，Vision1DStyle 方式）
         self.q_proj = nn.Conv1d(channels, channels, kernel_size=1)
         self.k_proj = nn.Conv1d(channels, channels, kernel_size=1)
         self.v_proj = nn.Conv1d(channels, channels, kernel_size=1)
 
-        # HierarchicalPolarRoPE（层次化频率编码）
         self.rrpe = HierarchicalPolarRoPE(C=channels, L=L, max_relative_angle=K)
 
-        # 输出投影
         self.out_proj = nn.Conv1d(channels, channels, kernel_size=1)
-
-        # Norm（在输入 C 维度）
         self.norm = nn.LayerNorm(channels)
-
-        # Scale
         self.scale = (L // num_heads) ** -0.5
 
     def forward(self, x):
         """
         x: (B, K, L, C) - K 条线
-
-        Returns:
-            out: (B, K, L, C) - 带有 HierarchicalPolarRoPE 的注意力输出
+        返回: (B, K, L, C)
         """
         B, K, L, C = x.shape
 
-        # Preserve the semantic layout explicitly:
-        # (B, K, L, C) -> (B, K, C, L) -> (B*K, C, L).
-        # Direct reshape would scramble the radial and channel dimensions.
+        # (B, K, L, C) -> (B, K, C, L) -> (B*K, C, L)，避免直接 reshape 打乱径向与通道维度
         x_reshaped = x.permute(0, 1, 3, 2).contiguous().reshape(B * K, C, L)
 
-        # 2. 归一化（沿 C 维度）
-        x_norm = x_reshaped.permute(0, 2, 1)  # (B*K, L, C)
-        x_norm = self.norm(x_norm)  # (B*K, L, C)
-        x_norm = x_norm.permute(0, 2, 1)  # (B*K, C, L)
+        x_norm = x_reshaped.permute(0, 2, 1)
+        x_norm = self.norm(x_norm)
+        x_norm = x_norm.permute(0, 2, 1)
 
-        # 3. 一次性计算所有 Q、K、V（Vision1DStyle 方式，使用 Conv1d）
-        q_all = self.q_proj(x_norm)  # (B*K, C, L)
-        k_all = self.k_proj(x_norm)  # (B*K, C, L)
-        v_all = self.v_proj(x_norm)  # (B*K, C, L)
+        q_all = self.q_proj(x_norm)
+        k_all = self.k_proj(x_norm)
+        v_all = self.v_proj(x_norm)
 
-        # 重塑为 (B, K, C, L)
-        q_all = q_all.reshape(B, K, C, L)  # (B, K, C, L)
-        k_all = k_all.reshape(B, K, C, L)  # (B, K, C, L)
-        v_all = v_all.reshape(B, K, C, L)  # (B, K, C, L)
+        q_all = q_all.reshape(B, K, C, L)
+        k_all = k_all.reshape(B, K, C, L)
+        v_all = v_all.reshape(B, K, C, L)
 
-        # 4. 计算相对角度矩阵（转换为弧度）
-        idx_i = torch.arange(K, device=x.device).unsqueeze(1)  # (K, 1)
-        idx_j = torch.arange(K, device=x.device).unsqueeze(0)  # (1, K)
-        rel_angle_idx = (idx_j - idx_i) % K  # (K, K)
+        idx_i = torch.arange(K, device=x.device).unsqueeze(1)
+        idx_j = torch.arange(K, device=x.device).unsqueeze(0)
+        rel_angle_idx = (idx_j - idx_i) % K
 
-        # 5. 对 K 应用 HierarchicalPolarRoPE（层次化频率编码）
-        k_rrpe = self.rrpe(k_all.permute(0, 2, 1, 3), rel_angle_idx)  # (B, C, K, K, L)
+        k_rrpe = self.rrpe(k_all.permute(0, 2, 1, 3), rel_angle_idx)
 
-        # 6. 标准矩阵乘法注意力 (Model 11.1: 标准注意力)
-        # 设计: 每条线 i 独立做 L 维度的标准注意力
-        # RoPE 编码了 K 维度的相对角度信息到特征中
+        q = q_all.permute(0, 1, 3, 2).reshape(B * K, L, C)
+        v = v_all.permute(0, 1, 3, 2).reshape(B * K, L, C)
 
-        # Q, K, V 形状调整: (B, K, C, L) -> (B*K, L, C)
-        q = q_all.permute(0, 1, 3, 2).reshape(B * K, L, C)  # (BK, L, C)
-        v = v_all.permute(0, 1, 3, 2).reshape(B * K, L, C)  # (BK, L, C)
+        # k_rrpe[:, :, i, j, :] 表示线 j 相对于线 i 的编码特征，对 K 维度平均聚合角度信息
+        k_rope = k_rrpe.mean(dim=3)
+        k = k_rope.permute(0, 2, 3, 1).reshape(B * K, L, C)
 
-        # 对于 K: 从 k_rrpe (B, C, K, K, L) 提取每条线的编码后特征
-        # k_rrpe[:, :, i, j, :] 表示线j相对于线i的编码特征
-        # 简化: 对 K 维度求和/平均，将角度信息聚合到特征中
-        k_rope = k_rrpe.mean(dim=3)  # (B, C, K, L) - 对 K 维度平均
-        k = k_rope.permute(0, 2, 3, 1).reshape(B * K, L, C)  # (BK, L, C)
-
-        # 标准矩阵乘法注意力
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (BK, L, L)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)  # (BK, L, C)
+        out = torch.matmul(attn, v)
 
-        # Output projection with the same explicit inverse layout.
         out = out.reshape(B, K, L, C)
         out = out.permute(0, 1, 3, 2).contiguous().reshape(B * K, C, L)
         out = self.out_proj(out)
 
-        # Residual connection and exact inverse transform to (B, K, L, C).
         out = out + x_reshaped
         return out.reshape(B, K, C, L).permute(0, 1, 3, 2).contiguous()
 
 
-class LGMBlock_model15(nn.Module):
+class LGMBlock(nn.Module):
     """
-    Model 15 的 LGMBlock：基于 11.1_no_mamba，RLE 中禁用 Mamba 分支，保留 CircularPolarConv2d + HPRPE Attention。
+    LGMBlock：禁用 Mamba 分支，保留 CircularPolarConv2d + HPRPE Attention。
     """
     def __init__(self, channels, K=12, drop_path=0.2):
         super().__init__()
@@ -274,7 +221,6 @@ class LGMBlock_model15(nn.Module):
         self.pre_norm = nn.LayerNorm(channels)
         self.pre_act = nn.SiLU()
         self.conv_branch = nn.Sequential(CircularPolarConv2d(channels), CircularPolarConv2d(channels))
-        # Model 10: 使用带有 RRPE 的 CircularSelfAttention
         self.ang_interact = CircularSelfAttentionWithRRPE(channels, K=K*2)
         self.fusion = nn.Sequential(nn.Linear(channels * 2, channels), nn.LayerNorm(channels), nn.SiLU())
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -282,9 +228,9 @@ class LGMBlock_model15(nn.Module):
 
     def forward(self, x):
         B, H, W, C = x.shape
-        x_p = self.pre_conv(x.permute(0, 3, 1, 2))                           # (B, C, H, W)
-        x_p = self.pre_norm(x_p.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)    # LN over C
-        x_p = self.pre_act(x_p).permute(0, 2, 3, 1)                          # (B, H, W, C)
+        x_p = self.pre_conv(x.permute(0, 3, 1, 2))
+        x_p = self.pre_norm(x_p.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_p = self.pre_act(x_p).permute(0, 2, 3, 1)
         x_norm = self.norm(x_p)
         x_conv = self.conv_branch(x_norm.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
         out_rad = torch.zeros_like(x_norm)
@@ -293,14 +239,13 @@ class LGMBlock_model15(nn.Module):
         return x + self.drop_path(x_conv + x_inter)
 
 # ==========================================
-# 核心计算组件 (Model 5.52: 跨波段并行卷积)
+# 核心计算组件
 # ==========================================
 
 class SpeMamba(nn.Module):
-    """Model 5.52: 修复了旋转敏感的 1D 卷积，改为旋转不变的 1x1 卷积，并增加了外层残差"""
+    """1x1 卷积 + 双向 Mamba 融合，含外层残差"""
     def __init__(self, channels, bidirectional=True):
         super().__init__()
-        # 🔴 关键修复：采用 1x1 卷积保证旋转不变性
         self.conv_point = nn.Conv2d(channels, channels, kernel_size=1)
         self.mamba = Mamba(d_model=channels, d_state=16, d_conv=4, expand=2)
         self.bidirectional = bidirectional
@@ -311,7 +256,6 @@ class SpeMamba(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # 1x1 卷积支路
         x_conv = self.conv_point(x)
 
         x_flat = x.permute(0, 2, 3, 1).reshape(B * H * W, 1, C)
@@ -321,8 +265,8 @@ class SpeMamba(nn.Module):
             out = out + out_rev
         x_mamba = out.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
-        fused = (x_conv + x_mamba).permute(0, 2, 3, 1)  # (B, H, W, C)
-        fused = self.norm(fused).permute(0, 3, 1, 2)     # back to (B, C, H, W)
+        fused = (x_conv + x_mamba).permute(0, 2, 3, 1)
+        fused = self.norm(fused).permute(0, 3, 1, 2)
         return x + self.act(fused)
 
 class RadialLineSampler(nn.Module):
@@ -445,7 +389,6 @@ class RadialFlowNet(nn.Module):
 class RadialLineFlowNet(nn.Module):
     def __init__(self, in_channels, hidden_dim=64, patch_size=11, num_classes=15, num_layers=2, lidar_channels=1, K=12):
         super().__init__()
-        # Model 10: K is now configurable
         self.sampler = RadialLineSampler(K=K, L=11, patch_size=patch_size)
         self.grad_extract = LiDARGradientModule()
         self.lidar_dim = 2 if lidar_channels == 1 else lidar_channels
@@ -454,14 +397,11 @@ class RadialLineFlowNet(nn.Module):
     def forward(self, hsi_feat, lidar): pass
 
 
-class RadialSynergyNet_model15_3(nn.Module):
+class RadialSynergyNet(nn.Module):
     """
-    Model 15: 从 11.1_no_mamba 完整复制出的论文主模型基础版。
-
-    结构要点：
-    - RLE/LGM 中禁用径向 Mamba 分支
-    - 保留 CircularPolarConv2d、HierarchicalPolarRoPE attention、外部 E_rad 位置编码
-    - 保留 SSA/Spectral Mamba、aux logits 和 center head
+    径向协同网络：LGM 中禁用径向 Mamba 分支，
+    保留 CircularPolarConv2d、HierarchicalPolarRoPE attention、外部位置编码，
+    以及 Spectral Mamba、aux logits 和 center head。
     """
     def __init__(self, hsi_channels, lidar_channels=1, hidden_dim=64, patch_size=11, num_classes=15, num_layers=2, K=12):
         super().__init__()
@@ -475,9 +415,8 @@ class RadialSynergyNet_model15_3(nn.Module):
         self.ring_expert = RadialFlowNet(hsi_channels, hidden_dim, patch_size, num_classes, lidar_channels)
         self.line_expert = RadialLineFlowNet(hsi_channels, hidden_dim, patch_size, num_classes, num_layers, lidar_channels, K)
 
-        # Model 15: standalone LGM block copied from 11.1_no_mamba.
-        self.h_layers = nn.ModuleList([LGMBlock_model15(hidden_dim, K) for _ in range(num_layers)])
-        self.l_layers = nn.ModuleList([LGMBlock_model15(hidden_dim, K) for _ in range(num_layers)])
+        self.h_layers = nn.ModuleList([LGMBlock(hidden_dim, K) for _ in range(num_layers)])
+        self.l_layers = nn.ModuleList([LGMBlock(hidden_dim, K) for _ in range(num_layers)])
         self.cross_layers = nn.ModuleList([RadialSymmetricCrossAttention(hidden_dim) for _ in range(num_layers)])
 
         # Synergy Head
