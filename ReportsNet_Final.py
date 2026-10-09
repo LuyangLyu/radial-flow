@@ -5,9 +5,6 @@ from mamba_ssm import Mamba
 import math
 import numpy as np
 
-# ==========================================
-# 辅助基础模块 (Utility Modules)
-# ==========================================
 
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
@@ -67,49 +64,34 @@ class CircularPolarConv2d(nn.Module):
         x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         return self.act(x)
 
-# ==========================================
-# 层次化频率 RoPE
-# ==========================================
 
 class HierarchicalPolarRoPE(nn.Module):
-    """
-    层次化极坐标旋转位置编码 (Hierarchical Frequency RoPE)
 
-    - L 维（径向）：多频率 RoPE，不同通道对使用不同频率，捕获多尺度径向结构
-    - K 维（角度）：单频率真 2D 旋转矩阵，实现真正的旋转等变性
 
-    数学公式：
-    - Radial (L): x'_c = x_c * cos(l * ω_c) + x_{c+1} * sin(l * ω_c)
-    - Angular (K): 对通道对 (c, c+1) 应用 2D 旋转矩阵
-    """
     def __init__(self, C, L, max_relative_angle, base=10000):
         super().__init__()
         self.C = C
         self.L = L
         self.max_relative_angle = max_relative_angle
 
-        # L 维：多频率 RoPE，频率 ω_c = base^(-2c/d), d = C // 2
+
         d = C // 2
         freqs = 1.0 / (base ** (torch.arange(0, d, 1).float() / d))
         self.register_buffer('freqs', freqs)
 
-        # K 维：预计算所有相对角度的 sin/cos（单频率）
+
         angles_idx = torch.arange(max_relative_angle).float()
         rotation_angles = angles_idx * (2 * math.pi / max_relative_angle)
         self.register_buffer('sin_vals', torch.sin(rotation_angles))
         self.register_buffer('cos_vals', torch.cos(rotation_angles))
 
     def forward(self, x, rel_angle_idx):
-        """
-        x: (B, C, K, L)
-        rel_angle_idx: (K, K)
-        返回旋转后的特征 (B, C, K, K, L)
-        """
+
+
         B, C, K_num, L = x.shape
         K = K_num
 
-        # ========== Step 1: L 维多频率 RoPE（径向） ==========
-        # C 分为两组通道对，应用不同频率
+
         x_reshaped = x.view(B, 2, C // 2, K, L)
 
         l_positions = torch.arange(L, device=x.device).float()
@@ -125,8 +107,7 @@ class HierarchicalPolarRoPE(nn.Module):
             x_0 * sin_l + x_1 * cos_l,
         ], dim=1)
 
-        # ========== Step 2: K 维真 2D 旋转（角度） ==========
-        # 扩展 x 以生成所有相对角度的版本
+
         x_expanded = x_l_rope.unsqueeze(2).expand(-1, -1, K, -1, -1)
 
         sin_theta = self.sin_vals[rel_angle_idx]
@@ -145,10 +126,8 @@ class HierarchicalPolarRoPE(nn.Module):
 
 
 class CircularSelfAttentionWithRRPE(nn.Module):
-    """
-    基线-转线分离设计的注意力：每条线都作为基线，与其他所有转线交互。
-    Q 来自线 i，K、V 来自线 j；对 K 应用 HierarchicalPolarRoPE。
-    """
+
+
     def __init__(self, channels, L=11, K=24, num_heads=1):
         super().__init__()
         self.K, self.L, self.C = K, L, channels
@@ -165,13 +144,11 @@ class CircularSelfAttentionWithRRPE(nn.Module):
         self.scale = (L // num_heads) ** -0.5
 
     def forward(self, x):
-        """
-        x: (B, K, L, C) - K 条线
-        返回: (B, K, L, C)
-        """
+
+
         B, K, L, C = x.shape
 
-        # (B, K, L, C) -> (B, K, C, L) -> (B*K, C, L)，避免直接 reshape 打乱径向与通道维度
+
         x_reshaped = x.permute(0, 1, 3, 2).contiguous().reshape(B * K, C, L)
 
         x_norm = x_reshaped.permute(0, 2, 1)
@@ -195,7 +172,7 @@ class CircularSelfAttentionWithRRPE(nn.Module):
         q = q_all.permute(0, 1, 3, 2).reshape(B * K, L, C)
         v = v_all.permute(0, 1, 3, 2).reshape(B * K, L, C)
 
-        # k_rrpe[:, :, i, j, :] 表示线 j 相对于线 i 的编码特征，对 K 维度平均聚合角度信息
+
         k_rope = k_rrpe.mean(dim=3)
         k = k_rope.permute(0, 2, 3, 1).reshape(B * K, L, C)
 
@@ -212,9 +189,8 @@ class CircularSelfAttentionWithRRPE(nn.Module):
 
 
 class LGMBlock(nn.Module):
-    """
-    LGMBlock：禁用 Mamba 分支，保留 CircularPolarConv2d + HPRPE Attention。
-    """
+
+
     def __init__(self, channels, K=12, drop_path=0.2):
         super().__init__()
         self.pre_conv = nn.Conv2d(channels, channels, 1)
@@ -238,12 +214,9 @@ class LGMBlock(nn.Module):
         x_inter = self.fusion(torch.cat([out_rad, out_ang], dim=-1))
         return x + self.drop_path(x_conv + x_inter)
 
-# ==========================================
-# 核心计算组件
-# ==========================================
 
 class SpeMamba(nn.Module):
-    """1x1 卷积 + 双向 Mamba 融合，含外层残差"""
+
     def __init__(self, channels, bidirectional=True):
         super().__init__()
         self.conv_point = nn.Conv2d(channels, channels, kernel_size=1)
@@ -369,9 +342,6 @@ class CrossModalAttentionFusion(nn.Module):
         g = self.gate(torch.cat([h_en, l_en], dim=-1))
         return (g * h_en + (1 - g) * l_en).reshape(B, L, S, C)
 
-# ==========================================
-# 完整网络 (Network Architectures)
-# ==========================================
 
 class RadialFlowNet(nn.Module):
     def __init__(self, in_channels, hidden_dim=64, patch_size=11, num_classes=15, lidar_channels=1):
@@ -398,11 +368,8 @@ class RadialLineFlowNet(nn.Module):
 
 
 class RadialSynergyNet(nn.Module):
-    """
-    径向协同网络：LGM 中禁用径向 Mamba 分支，
-    保留 CircularPolarConv2d、HierarchicalPolarRoPE attention、外部位置编码，
-    以及 Spectral Mamba、aux logits 和 center head。
-    """
+
+
     def __init__(self, hsi_channels, lidar_channels=1, hidden_dim=64, patch_size=11, num_classes=15, num_layers=2, K=12):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -419,7 +386,7 @@ class RadialSynergyNet(nn.Module):
         self.l_layers = nn.ModuleList([LGMBlock(hidden_dim, K) for _ in range(num_layers)])
         self.cross_layers = nn.ModuleList([RadialSymmetricCrossAttention(hidden_dim) for _ in range(num_layers)])
 
-        # Synergy Head
+
         self.total_feat_dim = 7 * hidden_dim
         self.synergy_head = nn.Sequential(
             nn.Linear(self.total_feat_dim, 256),
